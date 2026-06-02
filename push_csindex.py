@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -12,6 +13,11 @@ import requests
 CSQAQ_URL = "https://api.csqaq.com/api/v1/current_data"
 BEIJING = timezone(timedelta(hours=8))
 SUCCESS_CODES = {0, 200}
+
+# 飞书侧瞬时错误:重试大概率可成功(11232 限流 / 19006 内部错误)
+TRANSIENT_FEISHU_CODES = {11232, 19006}
+RETRY_DELAY = 300  # 失败后等待秒数
+MAX_RETRIES = 3    # 额外重试次数(共尝试 1 + MAX_RETRIES 次)
 
 GREEDY_EMOJI = {
     "extreme_fear": "😱",
@@ -185,16 +191,24 @@ def build_card(data: dict) -> dict:
 
 
 def send_feishu(webhook: str, card: dict) -> None:
-    resp = requests.post(
-        webhook,
-        json={"msg_type": "interactive", "card": card},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    body = resp.json()
-    if body.get("code", body.get("StatusCode", -1)) != 0:
-        raise RuntimeError(f"feishu error: {body}")
-    print(f"[{datetime.now(BEIJING).isoformat()}] sent ok")
+    payload = {"msg_type": "interactive", "card": card}
+    for attempt in range(MAX_RETRIES + 1):
+        resp = requests.post(webhook, json=payload, timeout=10)
+        resp.raise_for_status()
+        body = resp.json()
+        code = body.get("code", body.get("StatusCode", -1))
+        if code == 0:
+            print(f"[{datetime.now(BEIJING).isoformat()}] sent ok")
+            return
+        # 非瞬时错误(如 webhook 失效),直接失败,重试无意义
+        if code not in TRANSIENT_FEISHU_CODES or attempt == MAX_RETRIES:
+            raise RuntimeError(f"feishu error: {body}")
+        print(
+            f"[{datetime.now(BEIJING).isoformat()}] feishu transient error {body}; "
+            f"retry {attempt + 1}/{MAX_RETRIES} in {RETRY_DELAY}s",
+            file=sys.stderr,
+        )
+        time.sleep(RETRY_DELAY)
 
 
 def main() -> int:
